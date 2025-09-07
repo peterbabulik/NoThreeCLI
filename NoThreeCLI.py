@@ -19,25 +19,19 @@ def search_worker(query, path):
     """
     global results_buffer
     
-    # Split the user's query into a list of keywords
     keywords = [word for word in query.lower().split() if word]
     results = []
 
     if keywords:
-        # The current thread is passed so we can check if it's been cancelled
         current_thread = threading.current_thread()
         for root, dirs, files in os.walk(path, topdown=True):
-            # If the main loop started a new search, this thread is obsolete; stop it.
             if not getattr(current_thread, 'is_active', True):
                 return
 
-            # Optimization: Exclude common irrelevant directories
             dirs[:] = [d for d in dirs if not (d.startswith('.') or d in {'__pycache__', 'node_modules', '.git'})]
 
-            # Combine files and dirs for a single loop
             for name in files + dirs:
                 full_path = os.path.join(root, name)
-                # Match only if the path contains ALL keywords
                 if all(word in full_path.lower() for word in keywords):
                     item_type = "[F]" if name in files else "[D]"
                     results.append((item_type, full_path))
@@ -51,7 +45,13 @@ def main_loop(stdscr):
     
     # --- Curses Initialization ---
     curses.curs_set(0)  # Hide cursor
-    stdscr.nodelay(1)   # Make getch() non-blocking
+    
+    # --- MAJOR CHANGE #1: Use a timeout instead of nodelay ---
+    # This makes getch() a blocking call, which is the key to reducing CPU usage.
+    # It will wait for 100ms for a keypress before timing out.
+    # stdscr.nodelay(1)  # OLD METHOD: Caused high CPU usage
+    stdscr.timeout(100) # NEW METHOD: Low CPU usage
+    
     curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)
     HIGHLIGHT_STYLE = curses.color_pair(1)
 
@@ -63,6 +63,7 @@ def main_loop(stdscr):
 
     while True:
         # --- Handle incoming results from the search thread ---
+        # This check now runs approximately 10 times per second instead of continuously.
         with thread_lock:
             if results_buffer is not None:
                 results = results_buffer
@@ -86,47 +87,49 @@ def main_loop(stdscr):
         stdscr.refresh()
 
         # --- Handle User Input ---
+        # This call will now BLOCK, waiting for a key or the 100ms timeout.
         key = stdscr.getch()
-        if 32 <= key <= 126:  # Printable characters
-            query += chr(key)
-        elif key in {curses.KEY_BACKSPACE, 127}:
-            query = query[:-1]
-        elif key == curses.KEY_UP:
-            selected_index = max(0, selected_index - 1)
-        elif key == curses.KEY_DOWN:
-            selected_index = min(len(results) - 1, selected_index + 1)
-        elif key in {curses.KEY_ENTER, 10, 13} and results:
-            # Open the selected item's parent directory
-            opener = 'open' if sys.platform == 'darwin' else 'xdg-open'
-            subprocess.Popen([opener, os.path.dirname(results[selected_index][1])])
         
-        # --- Scrolling Logic ---
-        # Scroll up if selection moves above the visible area
-        if selected_index < scroll_top:
-            scroll_top = selected_index
-        # Scroll down if selection moves below the visible area
-        if selected_index >= scroll_top + height - 2:
-            scroll_top = selected_index - height + 3
+        # We only process if a key was actually pressed (getch() returns -1 on timeout)
+        if key != -1:
+            if 32 <= key <= 126:
+                query += chr(key)
+            elif key in {curses.KEY_BACKSPACE, 127}:
+                query = query[:-1]
+            elif key == curses.KEY_UP:
+                selected_index = max(0, selected_index - 1)
+            elif key == curses.KEY_DOWN:
+                selected_index = min(len(results) - 1, selected_index + 1)
+            elif key in {curses.KEY_ENTER, 10, 13} and results:
+                opener = 'open' if sys.platform == 'darwin' else 'xdg-open'
+                subprocess.Popen([opener, os.path.dirname(results[selected_index][1])])
+            
+            # --- Scrolling and Thread Management only happen on a keypress ---
+            if selected_index < scroll_top:
+                scroll_top = selected_index
+            if selected_index >= scroll_top + height - 2:
+                scroll_top = selected_index - height + 3
 
-        # --- Thread Management: Trigger a new search on text change ---
-        if 32 <= key <= 126 or key in {curses.KEY_BACKSPACE, 127}:
-            if search_thread:
-                search_thread.is_active = False  # Signal the old thread to stop
+            if 32 <= key <= 126 or key in {curses.KEY_BACKSPACE, 127}:
+                if search_thread:
+                    search_thread.is_active = False
 
-            if len(query) > 2:
-                search_thread = threading.Thread(target=search_worker, args=(query, os.path.expanduser('~')))
-                search_thread.is_active = True
-                search_thread.start()
-            else:
-                results = []  # Clear results for short queries
+                if len(query) > 2:
+                    search_thread = threading.Thread(target=search_worker, args=(query, os.path.expanduser('~')))
+                    search_thread.is_active = True
+                    search_thread.start()
+                else:
+                    results = []
         
-        time.sleep(0.01)  # Prevent 100% CPU usage
+        # --- MAJOR CHANGE #2: The manual sleep is no longer needed ---
+        # The blocking nature of `stdscr.timeout()` handles the "pausing".
+        # time.sleep(0.01) # REMOVED
 
 # --- Main Execution Block ---
 if __name__ == "__main__":
     try:
         curses.wrapper(main_loop)
     except KeyboardInterrupt:
-        print('NoThreeCLI exited.')
+        pass # The finally block will handle the exit message
     finally:
         print('NoThreeCLI exited.')
